@@ -37,7 +37,7 @@ from gateway_burn_engine.chain import (
     DoubleBurnError,
     MockChainClient,
 )
-from gateway_burn_engine.registry import GatewayRegistry
+from gateway_burn_engine.registry import GatewayRegistry, OperatorRegistry, OracleRegistry
 
 
 class VerifyBatchRequest(BaseModel):
@@ -57,6 +57,8 @@ def build_app(
     chain_client: ChainClient | None = None,
 ) -> FastAPI:
     require_internal_token()
+    if os.environ.get("OROGEN_ENV", "").lower() == "production" and chain_client is None:
+        raise RuntimeError("production burn-engine requires a real ChainClient")
 
     app = FastAPI(title="gateway-burn-engine", version="0.1.0")
     allowed_hosts = [
@@ -70,17 +72,40 @@ def build_app(
     burns: list[BurnEvent] = []
     mints: list[MintEvent] = []
     registry = GatewayRegistry.from_env()
+    operator_registry = OperatorRegistry.from_env()
+    oracle_registry = OracleRegistry.from_env()
     app.state.config = config
     app.state.chain_client = client
     app.state.burns = burns
     app.state.mints = mints
     app.state.registry = registry
+    app.state.operator_registry = operator_registry
+    app.state.oracle_registry = oracle_registry
 
     def _gateway_pubkey_for(batch: SettlementBatch) -> str | None:
         # If no gateway is registered, fall back to length-only shape check
         # (skeleton/dev mode). In production the absence is enforced upstream
         # by the auth gate; this is defence-in-depth.
         return registry.get(batch.gateway_id)
+
+    def _oracle_pubkey_for(rate: OracleRate) -> str | None:
+        if not rate.oracle_id:
+            return None
+        return oracle_registry.get(rate.oracle_id)
+
+    def _operator_pubkeys_for(receipts: list[Receipt]) -> dict[str, str] | None:
+        if len(operator_registry) == 0:
+            if os.environ.get("OROGEN_ENV", "").lower() == "production":
+                raise HTTPException(
+                    status_code=503,
+                    detail="operator registry required in production",
+                )
+            return None
+        return {
+            r.operator_id: pub
+            for r in receipts
+            if (pub := operator_registry.get(r.operator_id)) is not None
+        }
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -96,6 +121,8 @@ def build_app(
         result = verify_batch(
             req.batch, req.receipts, req.oracle_rate,
             gateway_pubkey_hex=_gateway_pubkey_for(req.batch),
+            oracle_pubkey_hex=_oracle_pubkey_for(req.oracle_rate),
+            operator_pubkeys=_operator_pubkeys_for(req.receipts),
         )
         return {
             "ok": result.ok,
@@ -111,6 +138,8 @@ def build_app(
         result = verify_batch(
             req.batch, req.receipts, req.oracle_rate,
             gateway_pubkey_hex=_gateway_pubkey_for(req.batch),
+            oracle_pubkey_hex=_oracle_pubkey_for(req.oracle_rate),
+            operator_pubkeys=_operator_pubkeys_for(req.receipts),
         )
         if not result.ok:
             raise HTTPException(

@@ -28,9 +28,16 @@ class OracleRate(BaseModel):
     """Snapshot of the CUC↔OROG ratio at batch settlement time."""
 
     epoch_number: int
+    oracle_id: str = ""
     cuc_per_useful: int  # how many CUC units required to mint one OROG unit.
     min_ratio_bps: int = 5_000  # burn ≥ 0.5× mint × cuc_per_useful
     max_ratio_bps: int = 30_000  # burn ≤ 3.0× mint × cuc_per_useful (overburn cap)
+    signature: str = ""
+
+    def signing_payload(self) -> bytes:
+        d = self.model_dump(mode="json")
+        d.pop("signature", None)
+        return canonical_json(d)
 
 
 def compute_mint_for_receipts(receipts: list[Receipt]) -> int:
@@ -45,6 +52,8 @@ class VerificationFault(str, Enum):
     UNDERBURN = "Underburn"
     OVERBURN = "Overburn"
     BAD_SIGNATURE = "BadSignature"
+    BAD_ORACLE_SIGNATURE = "BadOracleSignature"
+    BAD_RECEIPT_SIGNATURE = "BadReceiptSignature"
     PER_OPERATOR_MISMATCH = "PerOperatorMismatch"
     EPOCH_MISMATCH = "EpochMismatch"
 
@@ -65,6 +74,8 @@ def verify_batch(
     oracle_rate: OracleRate,
     *,
     gateway_pubkey_hex: str | None = None,
+    oracle_pubkey_hex: str | None = None,
+    operator_pubkeys: dict[str, str] | None = None,
 ) -> BmeVerificationResult:
     """Verify the settlement batch matches the receipts + oracle rate.
 
@@ -77,6 +88,41 @@ def verify_batch(
     callers MUST pass `gateway_pubkey_hex` in security-critical contexts.
     """
     result = BmeVerificationResult(ok=True)
+
+    if oracle_pubkey_hex is not None:
+        if not verify_ed25519(
+            oracle_pubkey_hex, oracle_rate.signing_payload(), oracle_rate.signature,
+        ):
+            result.ok = False
+            result.faults.append(VerificationFault.BAD_ORACLE_SIGNATURE)
+            result.detail["oracle_signature"] = "ed25519 verification failed"
+    elif os.environ.get("OROGEN_ENV", "").lower() == "production":
+        result.ok = False
+        result.faults.append(VerificationFault.BAD_ORACLE_SIGNATURE)
+        result.detail["oracle_signature"] = (
+            "trusted oracle pubkey required in production"
+        )
+
+    if operator_pubkeys is not None:
+        for r in receipts:
+            pub = operator_pubkeys.get(r.operator_id)
+            if pub is None:
+                result.ok = False
+                result.faults.append(VerificationFault.BAD_RECEIPT_SIGNATURE)
+                result.detail[f"receipt:{r.job_id}"] = (
+                    f"unknown operator {r.operator_id!r}"
+                )
+                continue
+            if not verify_ed25519(pub, r.signing_payload(), r.operator_signature):
+                result.ok = False
+                result.faults.append(VerificationFault.BAD_RECEIPT_SIGNATURE)
+                result.detail[f"receipt:{r.job_id}"] = "operator signature invalid"
+    elif os.environ.get("OROGEN_ENV", "").lower() == "production":
+        result.ok = False
+        result.faults.append(VerificationFault.BAD_RECEIPT_SIGNATURE)
+        result.detail["receipt_signatures"] = (
+            "operator pubkeys required in production"
+        )
 
     if batch.epoch_number != oracle_rate.epoch_number:
         result.ok = False

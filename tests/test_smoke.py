@@ -12,6 +12,7 @@ from mining_types import (
     SettlementBatch,
     generate_keypair,
 )
+from mining_types.crypto import sign_ed25519
 
 from gateway_burn_engine import (
     BurnEngineConfig,
@@ -170,6 +171,66 @@ def test_verify_rejects_epoch_mismatch() -> None:
     result = verify_batch(batch, rs, oracle)
     assert not result.ok
     assert VerificationFault.EPOCH_MISMATCH in result.faults
+
+
+def test_verify_rejects_unsigned_oracle_rate_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OROGEN_ENV", "production")
+    rs = _make_receipts(2)
+    batch, pub = _make_batch(rs)
+    oracle = OracleRate(epoch_number=1, cuc_per_useful=2)
+    result = verify_batch(batch, rs, oracle, gateway_pubkey_hex=pub)
+    assert not result.ok
+    assert VerificationFault.BAD_ORACLE_SIGNATURE in result.faults
+
+
+def test_verify_accepts_signed_oracle_rate_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OROGEN_ENV", "production")
+    oracle_priv, oracle_pub = generate_keypair()
+    op_priv, op_pub = generate_keypair()
+    rs = [r.sign(op_priv) for r in _make_receipts(2)]
+    batch, pub = _make_batch(rs)
+    oracle = OracleRate(epoch_number=1, oracle_id="oracle-1", cuc_per_useful=2)
+    oracle = oracle.model_copy(
+        update={"signature": sign_ed25519(oracle_priv, oracle.signing_payload())}
+    )
+    result = verify_batch(
+        batch,
+        rs,
+        oracle,
+        gateway_pubkey_hex=pub,
+        oracle_pubkey_hex=oracle_pub,
+        operator_pubkeys={"op-1": op_pub},
+    )
+    assert result.ok, result.detail
+
+
+def test_verify_checks_operator_receipt_signatures_when_registry_available() -> None:
+    op_priv, op_pub = generate_keypair()
+    rs = [r.sign(op_priv) for r in _make_receipts(2)]
+    batch, pub = _make_batch(rs)
+    oracle = OracleRate(epoch_number=1, cuc_per_useful=2)
+    result = verify_batch(
+        batch,
+        rs,
+        oracle,
+        gateway_pubkey_hex=pub,
+        operator_pubkeys={"op-1": op_pub},
+    )
+    assert result.ok, result.detail
+    bad = rs[0].model_copy(update={"operator_signature": "00" * 64})
+    result_bad = verify_batch(
+        batch,
+        [bad, rs[1]],
+        oracle,
+        gateway_pubkey_hex=pub,
+        operator_pubkeys={"op-1": op_pub},
+    )
+    assert not result_bad.ok
+    assert VerificationFault.BAD_RECEIPT_SIGNATURE in result_bad.faults
 
 
 def test_execute_burn_succeeds_and_double_burn_rejected() -> None:
